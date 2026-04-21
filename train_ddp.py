@@ -34,14 +34,78 @@ import torch.nn.functional as F
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader
 
+# Patch utils.dist.load_ckpt BEFORE importing model. The upstream version has
+# two bugs that collide with our deferred-DDP-init setup:
+#   1. Non-local-rank-0 ranks never assign `save_path` when dist is not yet
+#      initialized, causing UnboundLocalError.
+#   2. When dist IS initialized, rank 0 downloads and broadcasts the path —
+#      but the broadcast happens inside the `if local0():` branch scope,
+#      skipping it on other ranks.
+# Our replacement: every rank independently calls hf_hub_download. The HF
+# cache is shared, so only the first rank actually pulls; the rest hit the
+# cache. Simple and correct under any combination of dist-init states.
+import utils.dist as _udist
+from huggingface_hub import hf_hub_download as _hf_hub_download
+
+
+def _patched_load_ckpt(load_from_location, expected_hash=None):
+    import os as _os
+    _os.environ.setdefault("HF_HUB_ENABLE_HF_TRANSFER", "1")
+    repo_id = "si-pbc/hertz-dev"
+    cache_dir = _os.environ.get("HF_HUB_CACHE")
+    save_path = _hf_hub_download(
+        repo_id=repo_id,
+        filename=f"{load_from_location}.pt",
+        cache_dir=cache_dir,
+    )
+    return T.load(save_path, weights_only=False, map_location="cpu")
+
+
+_udist.load_ckpt = _patched_load_ckpt
+# Also patch the already-imported name in any module that has a direct
+# reference. utils.__init__ re-exports load_ckpt, so update there too.
+import utils as _utils_pkg
+if hasattr(_utils_pkg, "load_ckpt"):
+    _utils_pkg.load_ckpt = _patched_load_ckpt
+
 from model import get_hertz_dev_config, HertzDevModel
-from utils.dist import init_dist, print0, rank0
+# We intentionally do NOT use utils.dist.init_dist here. That helper inits
+# the DDP process group before model loading, which trips a bug in
+# utils.dist.load_ckpt: on ranks with local_rank != 0, `save_path` is never
+# assigned before the broadcast block references it, raising
+# UnboundLocalError. Instead we set CUDA device manually, let each rank
+# independently pull from the shared HF cache, and init the process group
+# after the model is on the device.
+from utils.dist import print0, rank0
 from r2_dataset import R2DatasetConfig, R2ManifestDataset, collate_waveforms, list_manifests
 from ablation import apply_plex_mode
 from metrics import (
     ddp_sum_reduce, token_topk_accuracy, token_entropy,
     code_utilization, summarize_val,
 )
+
+
+def _setup_dist_pre_model():
+    """Read DDP env vars and set CUDA device. Do NOT init process group."""
+    rank = int(os.environ.get("RANK", "0"))
+    local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+    world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    if T.cuda.is_available():
+        T.cuda.set_device(local_rank)
+    return rank, local_rank, world_size
+
+
+def _init_process_group_post_model(rank, world_size):
+    """Init NCCL process group after model has loaded on each rank."""
+    if world_size > 1 and not T.distributed.is_initialized():
+        from datetime import timedelta
+        T.distributed.init_process_group(
+            backend="nccl",
+            timeout=timedelta(minutes=30),
+            rank=rank,
+            world_size=world_size,
+        )
+        print(f"Rank {rank} of {world_size}.", flush=True)
 
 
 # ---------------------------------------------------------------------------
@@ -263,6 +327,10 @@ def parse_args():
     p.add_argument("--grad_accum", type=int, default=1)
     p.add_argument("--grad_ckpt", action="store_true")
     p.add_argument("--num_workers", type=int, default=2)
+    p.add_argument("--no_8bit_optimizer", action="store_true",
+                   help="Use full-precision AdamW. Default is bitsandbytes AdamW8bit "
+                        "which shrinks optim state ~4x; full-precision OOMs on 80 GB "
+                        "H100 with this 6.6B-param top model.")
 
     # Validation
     p.add_argument("--val_every", type=int, default=50)
@@ -296,31 +364,46 @@ def build_loader(manifest_keys, bucket, prefix, split, rank, world_size,
 def main():
     args = parse_args()
 
-    rank, local_rank, world_size = init_dist()
+    # ---- Stage 1: dist env + CUDA device only. No process group yet. ----
+    rank, local_rank, world_size = _setup_dist_pre_model()
     device = f"cuda:{local_rank}"
-    T.cuda.set_device(device)
     T.manual_seed(args.seed + rank)
     np.random.seed(args.seed + rank)
     random.seed(args.seed + rank)
 
-    if rank0():
+    if rank == 0:
         Path(args.save_dir).mkdir(parents=True, exist_ok=True)
 
-    # ------------------------------------------------------------------
-    # Manifests discovered on rank 0, broadcast.
-    # ------------------------------------------------------------------
-    if rank0():
-        keys = list_manifests(args.bucket, args.manifest_prefix)
-        if args.max_manifests > 0:
-            keys = keys[: args.max_manifests]
-        print0(f"[data] discovered {len(keys)} manifests")
-    else:
-        keys = None
-    if T.distributed.is_initialized():
-        obj = [keys]
-        T.distributed.broadcast_object_list(obj, src=0)
-        keys = obj[0]
+    # ---- Stage 2: manifest discovery (each rank hits R2 independently) ----
+    keys = list_manifests(args.bucket, args.manifest_prefix)
+    if args.max_manifests > 0:
+        keys = keys[: args.max_manifests]
+    if rank == 0:
+        print(f"[data] discovered {len(keys)} manifests", flush=True)
 
+    # ---- Stage 3: model loading. Each rank pulls from the shared HF cache. ----
+    if rank == 0:
+        print("[model] building hertz-dev (is_split=False)", flush=True)
+    model_cfg = get_hertz_dev_config(is_split=False)
+    model: HertzDevModel = model_cfg()
+    model = model.to(device).bfloat16()
+
+    apply_plex_mode(model, disable=args.disable_plex, verbose=(rank == 0))
+
+    n_train, n_total = freeze_non_top(model)
+    if rank == 0:
+        print(f"[model] trainable: {n_train:,} / {n_total:,} "
+              f"({100.0 * n_train / max(n_total, 1):.2f}%)", flush=True)
+
+    model.audio_tokenizer.train(False)
+    model.resynthesizer.train(False)
+
+    if args.grad_ckpt:
+        enable_grad_ckpt(model)
+        if rank == 0:
+            print("[model] gradient checkpointing enabled", flush=True)
+
+    # ---- Stage 4: build dataloaders (before DDP wrap is fine) ----
     train_ds, train_loader = build_loader(
         keys, args.bucket, args.manifest_prefix, "train",
         rank, world_size, args.batch_size, args.num_workers, args.seed,
@@ -331,32 +414,17 @@ def main():
         args.seed + 10001,
     )
 
-    # ------------------------------------------------------------------
-    # Model
-    # ------------------------------------------------------------------
-    print0("[model] building hertz-dev (is_split=False)")
-    model_cfg = get_hertz_dev_config(is_split=False)
-    model: HertzDevModel = model_cfg()
-    model = model.to(device).bfloat16()
-
-    apply_plex_mode(model, disable=args.disable_plex, verbose=rank0())
-
-    n_train, n_total = freeze_non_top(model)
-    print0(f"[model] trainable: {n_train:,} / {n_total:,} "
-           f"({100.0 * n_train / max(n_total, 1):.2f}%)")
-
-    # Put frozen submodules in inference mode (safety — they have no BN/Dropout,
-    # but be explicit).
-    model.audio_tokenizer.train(False)
-    model.resynthesizer.train(False)
-
-    if args.grad_ckpt:
-        enable_grad_ckpt(model)
-        print0("[model] gradient checkpointing enabled")
+    # ---- Stage 5: NOW init the process group and DDP-wrap the model. ----
+    _init_process_group_post_model(rank, world_size)
 
     if world_size > 1:
-        ddp_model = DDP(model, device_ids=[local_rank], output_device=local_rank,
-                        find_unused_parameters=True, broadcast_buffers=False)
+        ddp_model = DDP(
+            model, device_ids=[local_rank], output_device=local_rank,
+            find_unused_parameters=True, broadcast_buffers=False,
+            # Aliases grad buckets over p.grad memory to avoid the ~13 GiB
+            # duplicate allocation otherwise required for the bf16 top model.
+            gradient_as_bucket_view=True,
+        )
     else:
         ddp_model = model
     core: HertzDevModel = ddp_model.module if isinstance(ddp_model, DDP) else ddp_model
@@ -365,8 +433,19 @@ def main():
     # Optimizer
     # ------------------------------------------------------------------
     trainable_params = [p for p in ddp_model.parameters() if p.requires_grad]
-    optimizer = T.optim.AdamW(trainable_params, lr=args.lr,
-                              weight_decay=args.weight_decay, betas=(0.9, 0.95))
+    if args.no_8bit_optimizer:
+        optimizer = T.optim.AdamW(trainable_params, lr=args.lr,
+                                  weight_decay=args.weight_decay, betas=(0.9, 0.95))
+        if rank == 0:
+            print("[optim] AdamW (full precision)", flush=True)
+    else:
+        import bitsandbytes as _bnb
+        optimizer = _bnb.optim.AdamW8bit(
+            trainable_params, lr=args.lr,
+            weight_decay=args.weight_decay, betas=(0.9, 0.95),
+        )
+        if rank == 0:
+            print(f"[optim] bnb AdamW8bit (optim state ~4x smaller)", flush=True)
 
     start_step = 0
     if args.resume and os.path.exists(args.resume):

@@ -8,7 +8,7 @@ mkdir -p /root/ckpts
 mkdir -p /root/.cache/huggingface
 
 echo "[setup] pip install required packages"
-pip install --quiet boto3 >/dev/null
+pip install --quiet boto3 einops huggingface_hub hf_transfer soundfile bitsandbytes >/dev/null
 
 if [[ ! -f .env ]]; then
     echo "[setup] WARNING: .env not found — create it with R2_ACCOUNT_ID, R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY, R2_BUCKET"

@@ -7,3 +7,6 @@
 !prompts/*.m4a
 __pycache__
 *ckpt
+probe_samples/
+.env
+/root/
