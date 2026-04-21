@@ -93,10 +93,12 @@ def main():
     with T.no_grad():
         latents_in = model.tokenize(prompt_in)  # (1, T_lat, latent_size)
 
-    # Completion
+    # Completion (autocast to bf16 so the resynthesizer's quantizer
+    # indices_to_codes path — which produces float32 internals — is compatible
+    # with the bf16-cast Linear projection weights).
     print(f"[decode] generating {args.gen_seconds}s continuation")
     gen_frames = int(args.gen_seconds * 8)  # 16kHz / 2000 stride = 8 frames/s
-    with T.no_grad():
+    with T.no_grad(), T.autocast(device_type="cuda", dtype=T.bfloat16):
         generated_latents = model.completion(
             latents_in,
             temps=(args.temps_tok, (args.temps_cat, args.temps_gauss)),
@@ -104,7 +106,7 @@ def main():
             use_cache=True,
         )
     # Decode latents to waveform
-    with T.no_grad():
+    with T.no_grad(), T.autocast(device_type="cuda", dtype=T.bfloat16):
         audio = model.audio_tokenizer.data_from_latent(generated_latents)
     audio = audio.squeeze(0).float().cpu()  # (1, samples)
     # Normalize to avoid clipping
