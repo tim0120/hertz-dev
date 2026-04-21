@@ -146,7 +146,13 @@ class TransformerVAE(nn.Module):
         cache_idx = 0
         for l, layer in enumerate(self.stack.layers):
             if l == self.plex_layer:
-                if self.c.split:
+                if getattr(self, "_disable_plex", False):
+                    # Plex ablation: skip the quantized-latent injection entirely.
+                    # Residual passes through; split mode still forks into x1, x2.
+                    if self.c.split:
+                        x1 = x
+                        x2 = x
+                elif self.c.split:
                     plex1, plex2 = self.quantize(data)
                     plex1 = T.roll(plex1, -self.c.plex_roll, dims=1)
                     plex2 = T.roll(plex2, -self.c.plex_roll, dims=1)
